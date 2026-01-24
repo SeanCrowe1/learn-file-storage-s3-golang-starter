@@ -3,8 +3,10 @@ package main
 import (
 	"crypto/rand"
 	"encoding/base64"
-	"net/http"
+	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 )
 
 func (cfg apiConfig) ensureAssetsDir() error {
@@ -14,16 +16,34 @@ func (cfg apiConfig) ensureAssetsDir() error {
 	return nil
 }
 
-func getAssetPath(w http.ResponseWriter) (string, error) {
-	buffer := make([]byte, 32)
-	_, err := rand.Read(buffer)
+func getAssetPath(mediaType string) string {
+	base := make([]byte, 32)
+	_, err := rand.Read(base)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't generate URL", nil)
+		panic("failed to generate random bytes")
 	}
+	id := base64.RawURLEncoding.EncodeToString(base)
 
-	encoded := make([]byte, base64.RawURLEncoding.EncodedLen(len(buffer)))
-	base64.RawURLEncoding.Encode(encoded, buffer)
+	ext := mediaTypeToExt(mediaType)
+	return fmt.Sprintf("%s%s", id, ext)
+}
 
-	filename := string(encoded)
-	return filename, nil
+func (cfg apiConfig) getObjectURL(key string) string {
+	return fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, key)
+}
+
+func (cfg apiConfig) getAssetDiskPath(assetPath string) string {
+	return filepath.Join(cfg.assetsRoot, assetPath)
+}
+
+func (cfg apiConfig) getAssetURL(assetPath string) string {
+	return fmt.Sprintf("http://localhost:%s/assets/%s", cfg.port, assetPath)
+}
+
+func mediaTypeToExt(mediaType string) string {
+	parts := strings.Split(mediaType, "/")
+	if len(parts) != 2 {
+		return ".bin"
+	}
+	return "." + parts[1]
 }

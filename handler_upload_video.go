@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -14,6 +13,9 @@ import (
 )
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
+	const uploadLimit = 1 << 30
+	r.Body = http.MaxBytesReader(w, r.Body, uploadLimit)
+
 	videoIDString := r.PathValue("videoID")
 	videoID, err := uuid.Parse(videoIDString)
 	if err != nil {
@@ -35,83 +37,67 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 
 	video, err := cfg.db.GetVideo(videoID)
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Couldn't find video", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't find video", err)
 		return
 	}
-
 	if video.UserID != userID {
-		respondWithError(w, http.StatusUnauthorized, "video not owned by current user", nil)
+		respondWithError(w, http.StatusUnauthorized, "Not authorized to update this video", nil)
 		return
 	}
 
-	fmt.Println("uploading video", videoID, "by user", userID)
-
-	const maxMemory int64 = 1 << 30
-	r.Body = http.MaxBytesReader(w, r.Body, maxMemory)
-
-	file, header, err := r.FormFile("video")
+	file, handler, err := r.FormFile("video")
 	if err != nil {
 		respondWithError(w, http.StatusBadRequest, "Unable to parse form file", err)
 		return
 	}
 	defer file.Close()
 
-	contentType := header.Header.Get("Content-Type")
-	if contentType == "" {
-		respondWithError(w, http.StatusBadRequest, "Missing Content-Type for video", nil)
-		return
-	}
-
-	mediaType, _, err := mime.ParseMediaType(contentType)
+	mediaType, _, err := mime.ParseMediaType(handler.Header.Get("Content-Type"))
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Invalid Content-Type header", err)
+		respondWithError(w, http.StatusBadRequest, "Invalid Content-Type", err)
 		return
 	}
-
 	if mediaType != "video/mp4" {
-		respondWithError(w, http.StatusBadRequest, "Invalid file format", nil)
+		respondWithError(w, http.StatusBadRequest, "Invalid file type, only MP4 is allowed", nil)
 		return
 	}
 
-	temp, err := os.CreateTemp("", "tubely-upload.mp4")
+	tempFile, err := os.CreateTemp("", "tubely-upload.mp4")
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't create temporary file", err)
+		respondWithError(w, http.StatusInternalServerError, "Could not create temp file", err)
 		return
 	}
-	defer os.Remove(temp.Name())
-	defer temp.Close()
+	defer os.Remove(tempFile.Name())
+	defer tempFile.Close()
 
-	_, err = io.Copy(temp, file)
+	if _, err := io.Copy(tempFile, file); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Could not write file to disk", err)
+		return
+	}
+
+	_, err = tempFile.Seek(0, io.SeekStart)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't copy to temporary file", err)
+		respondWithError(w, http.StatusInternalServerError, "Could not reset file pointer", err)
 		return
 	}
 
-	filename, err := getAssetPath(w)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't encode filename", err)
-		return
-	}
-	filename += ".mp4"
-
-	_, err = temp.Seek(0, io.SeekStart)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't reset file read pointer", err)
-		return
-	}
-
-	cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
+	key := getAssetPath(mediaType)
+	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
-		Key:         aws.String(filename),
-		Body:        temp,
+		Key:         aws.String(key),
+		Body:        tempFile,
 		ContentType: aws.String(mediaType),
 	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error uploading file to S3", err)
+		return
+	}
 
-	url := "https://" + cfg.s3Bucket + ".s3." + cfg.s3Region + ".amazonaws.com/" + filename
+	url := cfg.getObjectURL(key)
 	video.VideoURL = &url
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "Couldn't update video record", err)
+		respondWithError(w, http.StatusInternalServerError, "Couldn't update video", err)
 		return
 	}
 
