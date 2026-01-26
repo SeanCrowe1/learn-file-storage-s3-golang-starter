@@ -5,6 +5,7 @@ import (
 	"mime"
 	"net/http"
 	"os"
+	"path"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -75,19 +76,46 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	outPath, err := processVideoForFastStart(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't process video for fast start", err)
+		return
+	}
+	outFile, err := os.Open(outPath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't open output file", err)
+		return
+	}
+	defer outFile.Close()
+
 	_, err = tempFile.Seek(0, io.SeekStart)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Could not reset file pointer", err)
 		return
 	}
 
+	ratio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Couldn't get video aspect ratio", err)
+		return
+	}
+
 	key := getAssetPath(mediaType)
+	switch ratio {
+	case "16:9":
+		key = path.Join("landscape", key)
+	case "9:16":
+		key = path.Join("portrait", key)
+	default:
+		key = path.Join("other", key)
+	}
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
 		Key:         aws.String(key),
-		Body:        tempFile,
+		Body:        outFile,
 		ContentType: aws.String(mediaType),
 	})
+
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Error uploading file to S3", err)
 		return
